@@ -1,0 +1,144 @@
+name: 'Tagger'
+
+inputs:
+  main-branch:
+    description: "Name of the branch that shouldn't get a generated suffix ('-beta' for the 'dev'-branch, otherwise '-alpha')."
+    type: string
+    required: false
+    default: "main"
+  suffix:
+    description: "Suffix to add to the semver-version. This overrides the default from the 'main-branch' input."
+    type: string
+    required: false
+    default: ""
+  message:
+    description: "Message to use for the tag if an upgrade was requested."
+    type: string
+    required: false
+    default: "Tagged by tagger"
+
+outputs:
+  TAG:
+    description: "Newly pushed tag, if an upgrade was requested."
+    value: ${{ steps.generate_tag.outputs.TAG }}
+
+runs:
+  using: "composite"
+  defaults:
+    shell: bash
+  steps:
+    - name: Set environment
+      id: env
+      run: |-
+        GIT_BRANCH="${GITHUB_REF##*/}"
+        echo "::set-output name=GIT_BRANCH::$GIT_BRANCH"
+
+    - name: Get upgrade type
+      id: get_upgrade_type
+      env:
+        COMMITS_JSON: ${{ toJSON(github.event.commits) }}
+      run: |-
+        set -euo pipefail
+
+        messages="$(echo "$COMMITS_JSON" | jq -r '.[] .message')"
+        count="$(echo "$messages" | wc -l)"
+        echo "Looping $count commit messages"
+
+        IFS=$'\n' && for message in $messages; do
+          echo "Checking '$message'"
+          if type="$(grep -Eo '#MAJOR|#MINOR|#PATCH' <<< "$message")"; then
+            if [ -n "$UPGRADE_TYPE" -a "$type" != "$UPGRADE_TYPE" ]; then
+              echo "Found both '$UPGRADE_TYPE' and '$type' in the commit messages. Refusing to continue"
+              exit 1
+            else
+              UPGRADE_TYPE="$type"
+            fi
+          fi
+        done
+
+        if [ -z "$UPGRADE_TYPE" ]; then
+          echo "No version bump was requested."
+          exit 0
+        fi
+
+        UPGRADE_TYPE="${UPGRADE_TYPE:1}" # Remove '#'-prefix
+        echo "::set-output name=UPGRADE_TYPE::$UPGRADE_TYPE"
+
+    - name: Get latest tag
+      id: generate_tag
+      if: steps.get_upgrade_type.outputs.UPGRADE_TYPE != ''
+      env:
+        GIT_BRANCH: ${{ steps.env.outputs.GIT_BRANCH }}
+        SUFFIX: ${{ steps.env.outputs.SUFFIX }}
+        MAIN_BRANCH: ${{ inputs.main-branch }}
+        UPGRADE_TYPE: ${{ steps.get_upgrade_type.outputs.UPGRADE_TYPE }}
+      run: |-
+        set -euo pipefail
+
+        echo "Retrieving existing tags"
+        git fetch --tags
+
+        set +e # An error occurs if there are no tags yet, so handle this situation
+        tags="$(git describe --always --tags $(git rev-list --tags --max-count=1000))"
+        set -e
+        count="$(echo "$tags" | wc -l)"
+
+        echo "Looping $count tags"
+        IFS=$'\n' && for tag in $tags; do
+          echo "Validating tag '$tag'"
+          if [[ "$tag" =~ ^[[:digit:]]+.[[:digit:]]+.[[:digit:]]+$ \
+            || "$tag" =~ ^[[:digit:]]+.[[:digit:]]+.[[:digit:]]+-.*$ ]]; then
+
+            last_tag="$tag"
+            break
+          fi
+        done
+
+        if [ -z "$last_tag" ]; then
+          echo "Generating first version tag"
+          MAJOR="0"
+          MINOR="0"
+          PATCH="0"
+        else
+          MAJOR="$(echo "$last_tag" | cut -d '.' -f 1)"
+          MINOR="$(echo "$last_tag" | cut -d '.' -f 2)"
+          PATCH="$(echo "$last_tag" | cut -d '.' -f 3)"
+          PATCH="$(echo "$PATCH" | cut -d '-' -f 1)" # Remove suffix
+        fi
+
+        # Only upgrade major and minor when running for the main branch
+        if [ "$GIT_BRANCH" == "${{ inputs.main-branch }}" -o "$UPGRADE_TYPE" == "PATCH" ]; then
+          (( PATCH = "$PATCH" + 1 ))
+        elif [ "$UPGRADE_TYPE" == "MINOR" ]; then
+          (( MINOR = "$MINOR" + 1 ))
+          PATCH="0"
+        else
+          (( MAJOR = "$MAJOR" + 1 ))
+          MINOR="0"
+          PATCH="0"
+        fi
+
+        if [ "$SUFFIX" == "" -a "$GIT_BRANCH" != "$MAIN_BRANCH" ]; then
+          if [ "$GIT_BRANCH" == "dev" ]; then
+            SUFFIX="-beta"
+          else
+            SUFFIX="-alpha"
+          fi
+        fi
+
+        echo "::set-output name=TAG::${MAJOR}.${MINOR}.${PATCH}${SUFFIX}"
+
+    - name: Push tag
+      id: push_tag
+      if: steps.get_upgrade_type.outputs.UPGRADE_TYPE != ''
+      env:
+        TAG: ${{ steps.generate_tag.outputs.TAG }}
+        MESSAGE: ${{ inputs.message }}
+      run: |-
+        set -euo pipefail
+
+        echo "Pushing tag '$TAG'"
+        git config user.email "no-reply@tagger.none"
+        git config user.name "Tagger"
+        git tag -a "$TAG" -m "$MESSAGE"
+        git push origin "$TAG"
